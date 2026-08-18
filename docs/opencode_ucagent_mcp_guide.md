@@ -1,20 +1,28 @@
-# opencode 连接 UCAgent MCP 指南
+# UCAgent + 后端 CLI 使用指南
 
-本文记录如何在 opencode 中通过 MCP 协议连接 UCAgent，让 opencode 作为
-MCP client 调用 UCAgent 的验证工具（`RoleInfo`、`CurrentTips`、`Complete`、
-`SetCurrentStageJournal` 等），驱动 NutShell Cache 的分阶段验证工作流。
+本文记录如何让 UCAgent 作为主控，通过 `--backend` 参数调用后端 CLI
+（opencode / Codex / Claude Code）执行各验证阶段任务。后端 CLI 通过 MCP
+连回 UCAgent，调用 `RoleInfo`、`CurrentTips`、`Complete`、`Exit` 等工具
+推进阶段。
 
-适用范围：所有支持 MCP-Server 调用的 LLM 客户端（opencode、Claude Code、
-Qwen-Code、Cherry Studio、VS Code Copilot 等）。本文以 opencode 为例。
+> **架构说明**：UCAgent 是主控（controller），后端 CLI 是执行后端（backend）。
+> UCAgent 启动自己的 MCP Server，生成 MCP 配置文件让后端连回，然后每个阶段
+> 调用后端 CLI 执行任务。用户不直接操作后端 CLI。
+
+```text
+UCAgent workflow (主控)
+  → 启动 MCP Server (127.0.0.1:<port>)
+  → 生成后端 MCP 配置 (opencode.json / .codex/config.toml / .mcp.json)
+  → 每个阶段调用后端 CLI (opencode run / codex exec / claude -p)
+  → 后端通过 MCP 回调 UCAgent 工具
+  → RoleInfo → CurrentTips → 执行任务 → SetCurrentStageJournal → Complete → Exit
+```
 
 ## 1. 前置条件
 
-- 已安装 UCAgent 并准备好 Python 虚拟环境（`.venv`）
-- 已安装 opencode，并能正常启动
-- 工作目录为 `/Users/zzy/Workspace/ucagent`
-- 准备一个可用于 MCP 模式的 DUT workspace（例如 `examples/Adder`）
-
-确认 UCAgent 可用：
+- UCAgent 源码和虚拟环境：`/Users/zzy/Workspace/ucagent/.venv`
+- 至少一个后端 CLI 已安装（opencode / codex / claude）
+- 工作目录：`/Users/zzy/Workspace/ucagent`
 
 ```bash
 cd /Users/zzy/Workspace/ucagent
@@ -22,139 +30,187 @@ source .venv/bin/activate
 ucagent --version
 ```
 
-确认 DUT workspace 结构（以 Adder 为例）：
+## 2. 后端配置
 
-```text
-examples/Adder/
-├── Adder/
-│   ├── __init__.py     # 必须存在，空文件即可
-│   └── Adder.v
-└── README.md            # 可选
+UCAgent 的后端配置在 `~/.ucagent/setting.yaml` 的 `backend` 段。每个后端
+定义 CLI 命令模板和 MCP 配置文件生成方式。
+
+### 2.1 可用后端
+
+| 后端 | CLI 命令 | MCP 配置文件 | 配置生成方式 |
+|------|---------|------------|------------|
+| `codex` | `codex exec` | `.codex/config.toml` | `pre_bash_cmd` 手写 |
+| `claude` | `claude -p` | `.mcp.json` | `pre_bash_cmd` 复制+sed |
+| `opencode` | `opencode run` | `opencode.json` | `render_files` 模板渲染 |
+
+### 2.2 Codex 后端（已验证）
+
+`~/.ucagent/setting.yaml` 中：
+
+```yaml
+backend:
+  codex:
+    clss: ucagent.abackend.UCAgentCmdLineBackend
+    args:
+      cli_cmd_new: "codex exec {UC_ENV_CMD_BACKEND_EX_ARGS} --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox < {MSG_FILE}"
+      cli_cmd_ctx: "codex exec {UC_ENV_CMD_BACKEND_EX_ARGS} --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox < {MSG_FILE}"
+      pre_bash_cmd:
+        - "mkdir -p {CWD}/.codex/"
+        - "echo \"\n[mcp_servers.ucagent]\nurl = 'http://127.0.0.1:{PORT}/mcp'\ntool_timeout_sec=600000000000\n\" > {CWD}/.codex/config.toml"
 ```
 
-如果缺少 `Adder/__init__.py`，UCAgent 会报错退出：
+### 2.3 Claude 后端（已验证）
 
-```text
-ERROR: File(s) Adder/__init__.py do not exist in workspace
+```yaml
+backend:
+  claude:
+    clss: ucagent.abackend.UCAgentCmdLineBackend
+    args:
+      cli_cmd_new: "claude {UC_ENV_CMD_BACKEND_EX_ARGS} --dangerously-skip-permissions -p < {MSG_FILE}"
+      cli_cmd_ctx: "claude {UC_ENV_CMD_BACKEND_EX_ARGS} --dangerously-skip-permissions -c -p < {MSG_FILE}"
+      pre_bash_cmd:
+        - "mkdir -p {CWD}/.claude/"
+        - "cp ~/.claude/.mcp.json {CWD}/.mcp.json"
+        - "sed -i '' 's/5000\\/mcp/{PORT}\\/mcp/' {CWD}/.mcp.json"
 ```
 
-补建即可：
+### 2.4 opencode 后端
 
-```bash
-mkdir -p examples/Adder/Adder
-touch examples/Adder/Adder/__init__.py
+UCAgent 默认配置（`ucagent/setting.yaml`）中已内置 opencode 后端模板：
+
+```yaml
+backend:
+  opencode:
+    clss: ucagent.abackend.UCAgentCmdLineBackend
+    args:
+      cli_cmd_new: "opencode run {UC_ENV_CMD_BACKEND_EX_ARGS} {UC_ENV_CMD_BACKEND_EX_ARGS_N} < {MSG_FILE}"
+      cli_cmd_ctx: "opencode run {UC_ENV_CMD_BACKEND_EX_ARGS} {UC_ENV_CMD_BACKEND_EX_ARGS_C} -c < {MSG_FILE}"
+      render_files:
+        "{ASSETS}/mcp_opencode.json": "{CWD}/opencode.json"
+      cfg_bash_enable: false
 ```
 
-## 2. 启动 UCAgent MCP Server
-
-UCAgent 的 MCP server 必须在 opencode 连接之前启动，并保持后台运行。
-
-### 2.1 关键参数说明
-
-| 参数 | 作用 | 必要性 |
-|------|------|--------|
-| `examples/Adder Adder` | workspace 路径与 DUT 名 | 必填 |
-| `--mcp-server` | 启用 MCP server | 必填 |
-| `--mcp-server-port 5002` | 指定端口（5000 常被 macOS ControlCenter 占用） | 必填 |
-| `--mcp-server-no-file-tools` | 不暴露 UCAgent 文件操作工具（由 client 自己处理文件） | 推荐 |
-| `--human` | 进入 human 协同模式，使 init_cmds 中的 `start_mcp_server` 被执行 | **关键** |
-| `--loop` | 启动 agent loop，防止进程在 pdb 提示符处立即退出 | **关键** |
-
-> **关键经验**：必须同时加 `--human` 和 `--loop`，并用 `sleep infinity |`
-> 保持 stdin 不关闭。否则 UCAgent 要么不执行 `start_mcp_server`，要么在
-> pdb 提示符处立即退出，MCP server 无法保持运行。
-
-### 2.2 推荐启动命令
-
-```bash
-cd /Users/zzy/Workspace/ucagent
-source .venv/bin/activate
-
-nohup bash -c 'sleep infinity | ucagent examples/Adder Adder \
-  --mcp-server --mcp-server-port 5002 --mcp-server-no-file-tools \
-  --human --loop' > /tmp/ucagent_mcp.log 2>&1 &
-
-echo "UCAgent MCP PID: $!"
-```
-
-### 2.3 验证 MCP Server 已启动
-
-等待约 10-15 秒后检查端口：
-
-```bash
-lsof -nP -iTCP:5002 -sTCP:LISTEN
-```
-
-期望输出（出现 Python 进程监听 5002 即成功）：
-
-```text
-COMMAND   PID  USER   FD   TYPE  DEVICE  SIZE/OFF NODE NAME
-Python   82068 zzy    7u  IPv4  ...     0t0  TCP 127.0.0.1:5002 (LISTEN)
-```
-
-查看启动日志确认 MCP 已就绪：
-
-```bash
-grep -E "FastMCP|5002|Uvicorn" /tmp/ucagent_mcp.log
-```
-
-期望关键行：
-
-```text
-create FastMCP server with tools: ['ReadTextFile', 'RoleInfo', 'CurrentTips', ...]
-FastMCP server started at 127.0.0.1:5002
-Uvicorn running on http://127.0.0.1:5002 (Press CTRL+C to quit)
-```
-
-快速测试 MCP 接口是否响应：
-
-```bash
-curl -s -X POST http://127.0.0.1:5002/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
-```
-
-期望返回 `event: message` 开头的 SSE 流，其中包含 `serverInfo` 字段。
-
-### 2.4 停止 UCAgent MCP Server
-
-```bash
-pkill -f "ucagent examples"
-# 或按 PID 停止
-kill <PID>
-```
-
-## 3. 配置 opencode 连接 UCAgent MCP
-
-编辑 opencode 全局配置 `~/.config/opencode/opencode.json`，在顶层添加 `mcp`
-字段：
+`render_files` 会将 `ucagent/assets/mcp_opencode.json` 模板渲染到工作目录的
+`opencode.json`，其中 `{{PORT}}` 替换为实际 MCP 端口。模板内容：
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
-    "ucagent": {
+    "unitytest": {
       "type": "remote",
-      "url": "http://127.0.0.1:5002/mcp",
-      "enabled": true
+      "url": "http://127.0.0.1:{{PORT}}/mcp",
+      "enabled": true,
+      "timeout": 600000000
     }
-  },
-  "model": "glm-5.2"
+  }
 }
 ```
 
-> opencode 的 `mcp` 配置支持 `local`（启动子进程）和 `remote`（连接已有
-> HTTP 端点）两种类型。UCAgent 已经作为独立服务启动，因此用 `remote`。
+如需使用 opencode 后端，将上述配置添加到 `~/.ucagent/setting.yaml` 的
+`backend` 段即可。
 
-## 4. 重启 opencode 并验证
+## 3. 关键启动参数
+
+| 参数 / 环境变量 | 作用 |
+|------|------|
+| `--backend <name>` | 指定后端 CLI（codex / claude / opencode） |
+| `UCAGENT_CMDLINE_START_MCP=1` | 让 UCAgent 在拉起后端前先启动 MCP Server |
+| `--mcp-server-port 5002` | MCP 端口（5000 常被 macOS ControlCenter 占用） |
+| `--mcp-server-no-file-tools` | 不暴露 UCAgent 文件操作工具（后端自己处理文件） |
+| `--exit-on-completion` | 全部阶段完成后自动退出 |
+| `--no-embed-tools` | 禁用 UCAgent 内嵌工具（由后端 CLI 处理） |
+| `--force-stage-index N` | 从第 N 个阶段开始（用于单阶段重跑） |
+| `-s` | 流式输出到控制台 |
+
+后端 CLI 的额外参数通过环境变量传递：
 
 ```bash
-opencode
+# Codex: 指定模型
+export UC_ENV_CMD_BACKEND_EX_ARGS="-m gpt-5.4-mini --ephemeral"
+
+# opencode: 通常留空
+export UC_ENV_CMD_BACKEND_EX_ARGS=""
 ```
 
-重启后，opencode 会自动加载新的 MCP 配置。UCAgent 提供的工具会以前缀
-`mcp__ucagent__` 出现在工具列表中，主要包括：
+## 4. 运行
+
+### 4.1 完整运行（所有阶段）
+
+以 Codex 后端为例：
+
+```bash
+cd /Users/zzy/Workspace/ucagent
+source .venv/bin/activate
+
+UCAGENT_CMDLINE_START_MCP=1 \
+UC_ENV_CMD_BACKEND_EX_ARGS="-m gpt-5.4-mini --ephemeral" \
+ucagent <workspace> <dut> \
+  --config <config.yaml> \
+  --backend codex \
+  --exit-on-completion \
+  --mcp-server-no-file-tools \
+  --mcp-server-host 127.0.0.1 \
+  --mcp-server-port 5002 \
+  --no-embed-tools \
+  -s
+```
+
+### 4.2 单阶段运行
+
+使用 `--force-stage-index` 从指定阶段开始，配合 `AGENTS.md` 中的指示
+（Complete 后立即 Exit），实现单阶段重跑：
+
+```bash
+UCAGENT_CMDLINE_START_MCP=1 \
+UC_ENV_CMD_BACKEND_EX_ARGS="-m gpt-5.4-mini --ephemeral" \
+ucagent <workspace> <dut> \
+  --config <config.yaml> \
+  --backend codex \
+  --exit-on-completion \
+  --mcp-server-no-file-tools \
+  --mcp-server-host 127.0.0.1 \
+  --mcp-server-port 5002 \
+  --force-stage-index <N> \
+  --no-embed-tools \
+  -s
+```
+
+本项目提供的辅助脚本 `scripts/run_ucagent_stage.sh` 封装了单阶段运行：
+
+```bash
+scripts/run_ucagent_stage.sh <stage_index>
+```
+
+### 4.3 预期日志
+
+成功运行时日志应包含：
+
+```text
+FastMCP server started at 127.0.0.1:5002
+Uvicorn running on http://127.0.0.1:5002
+```
+
+随后每个阶段：
+
+1. UCAgent 生成后端 MCP 配置文件
+2. 调用后端 CLI 执行任务
+3. 后端连接 UCAgent MCP，调用工具链
+4. UCAgent 推进到下一阶段
+
+```text
+mcp: ucagent/RoleInfo completed
+mcp: ucagent/CurrentTips completed
+mcp: ucagent/ReadTextFile completed
+mcp: ucagent/SetCurrentStageJournal completed
+mcp: ucagent/Complete completed
+```
+
+最终 `Exit` 后 UCAgent 退出。
+
+## 5. UCAgent MCP 工具一览
+
+后端 CLI 通过 MCP 调用以下 UCAgent 工具：
 
 | 工具 | 作用 |
 |------|------|
@@ -172,76 +228,51 @@ opencode
 | `AllStageJournal` | 获取所有阶段日志 |
 | `StageJournal` | 获取指定阶段日志 |
 
-## 5. 推荐的首条提示词
-
-按 UCAgent 官方文档建议，opencode 启动后输入以下提示词开始验证工作：
-
-```text
-请通过工具 `RoleInfo` 获取你的角色信息和基本指导，然后完成任务。
-请使用工具 `ReadTextFile` 读取文件。
-你需要在当前工作目录进行文件操作，不要超出该目录。
-```
-
-随后按 UCAgent 的工作流推进：`CurrentTips` → 执行任务 → `SetCurrentStageJournal`
-→ `Complete` →（如需）`Exit`。
-
 ## 6. 常见问题
 
 ### 6.1 端口 5000 被占用
 
-macOS ControlCenter 默认监听 5000 端口。改用 5002 或其他空闲端口：
+macOS ControlCenter 默认监听 5000。改用 5002：
 
 ```bash
-lsof -nP -iTCP:5000 -sTCP:LISTEN   # 确认占用
-# 改用 5002
---mcp-server-port 5002
+lsof -nP -iTCP:5002 -sTCP:LISTEN
 ```
 
-### 6.2 UCAgent 启动后立即退出
+### 6.2 后端找不到 MCP 工具
 
-症状：日志里出现 `UCAgent is exited.`，但没看到 `FastMCP server started`。
+确认 `UCAGENT_CMDLINE_START_MCP=1` 已设置，且日志中出现了
+`FastMCP server started`。如果 MCP Server 没有在后端启动前起来，后端
+无法连接 UCAgent 工具。
 
-原因：缺少 `--human` 或 `--loop`，或 stdin 被关闭导致 pdb 立即返回。
-
-解决：必须同时加 `--human --loop`，并用 `sleep infinity |` 保持 stdin：
-
-```bash
-nohup bash -c 'sleep infinity | ucagent examples/Adder Adder \
-  --mcp-server --mcp-server-port 5002 --mcp-server-no-file-tools \
-  --human --loop' > /tmp/ucagent_mcp.log 2>&1 &
-```
-
-### 6.3 `File(s) Adder/__init__.py do not exist`
+### 6.3 `File(s) <DUT>/__init__.py do not exist`
 
 UCAgent 要求 workspace 下存在 `<DUT>/<DUT>/__init__.py`（即使为空）：
 
 ```bash
-mkdir -p examples/Adder/Adder
-touch examples/Adder/Adder/__init__.py
+mkdir -p <workspace>/<DUT>/<DUT>
+touch <workspace>/<DUT>/<DUT>/__init__.py
 ```
 
-### 6.4 opencode 连接 MCP 失败
+### 6.4 opencode.json / config.toml 没有生成
 
-确认 UCAgent MCP 仍在运行：
+- opencode 后端：确认 `ucagent/assets/mcp_opencode.json` 模板存在
+- codex 后端：`pre_bash_cmd` 中的 `echo` 命令负责生成，检查 `{CWD}` 和
+  `{PORT}` 占位符是否正确替换
+- claude 后端：确认 `~/.claude/.mcp.json` 存在（`pre_bash_cmd` 会复制它）
 
-```bash
-lsof -nP -iTCP:5002 -sTCP:LISTEN
-curl -s http://127.0.0.1:5002/mcp
-```
+### 6.5 后端 CLI 报错 / 非零退出
 
-如果 UCAgent 已退出，按第 2 节重启。opencode 配置改完后必须**重启 opencode**
-才能生效（配置只在启动时加载一次）。
+UCAgent 会捕获后端退出码。如果后端频繁报错，检查：
 
-### 6.5 使用 Codex/Claude 后端而非 opencode
-
-UCAgent 也内置了对 Codex、Claude Code、opencode、Qwen-Code 等后端的适配，
-配置文件在 `~/.ucagent/setting.yaml` 的 `backend` 段。若想反过来让 UCAgent
-作为主控调用这些 CLI，参考 `instruction.md`（Codex 后端）或
-`ucagent/setting.yaml`（其他后端）。
+- 后端 CLI 自身模型配置
+- 网络连通性（模型 API 可达）
+- 先手动运行 `codex exec -p "hello"` / `opencode run -p "hello"` /
+  `claude -p "hello"` 确认基本功能正常
 
 ## 7. 参考链接
 
 - UCAgent MCP 集成官方文档：<https://ucagent.open-verify.cc/content/02_usage/00_mcp/>
 - UCAgent 仓库：<https://github.com/XS-MLVP/UCAgent>
 - opencode 配置 schema：<https://opencode.ai/config.json>
-- 本项目 Codex 后端使用记录：`instruction.md`
+- Codex 后端已验证记录：`instruction.md`
+- UCAgent 默认后端配置：`ucagent/setting.yaml`
